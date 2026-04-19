@@ -1,9 +1,12 @@
 from pydantic import BaseModel
 
+
 class ChatRequest(BaseModel):
-    user_id: str
+    user_id: str | None = None
     role: str
     query: str
 
+
 class ChatResponse(BaseModel):
-    response: str
+    intent: str
+    response: object

@@ -4,8 +4,13 @@ from app.services.ai_service import generate_response
 
 router = APIRouter()
 
+
 @router.post("/chat", response_model=ChatResponse)
 def chat_endpoint(request: ChatRequest):
-    ai_response = generate_response(request.role, request.query)
-    
-    return ChatResponse(response=ai_response)
+
+    result = generate_response(request.role, request.query)
+
+    return ChatResponse(
+        intent=result["intent"],
+        response=result["response"]
+    )
