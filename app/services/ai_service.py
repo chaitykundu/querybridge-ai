@@ -1,40 +1,41 @@
 from openai import OpenAI
 from app.core.config import settings
 from app.prompts.system_prompt import get_system_prompt
-
-from app.services.mock_service import (
-    get_total_sales,
-    get_sales_by_region,
-    get_total_leads
-)
+from app.services.query_router import route_query
+from app.services.sql_service import run_sql
 
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
 
 # -----------------------------
-# 1. AI INTENT DETECTION
+# CONVERT RAW DB RESULTS → HUMAN ANSWER
 # -----------------------------
-def detect_intent_with_ai(role: str, query: str):
+def summarize_data_with_ai(query: str, data: list, role: str) -> str:
+    """
+    Converts raw database rows into a natural language answer.
+    """
+    if not data:
+        return "No data was found in the database for your query."
+
+    if isinstance(data, dict) and "error" in data:
+        return f"There was a database error: {data['error']}"
+
+    # Limit rows sent to AI to avoid token overflow
+    data_str = str(data[:50])
+
     prompt = f"""
-You are an ERP intent classifier.
+You are a helpful ERP assistant responding to a {role}.
 
-User role: {role}
+The user asked: "{query}"
 
-Classify the user query into ONLY ONE intent:
+The database returned this data:
+{data_str}
 
-AVAILABLE INTENTS:
-- total_sales
-- sales_by_region
-- total_leads
-- unknown
-
-RULES:
-- Return ONLY the intent name
-- No explanation
-- No extra text
-- No punctuation
-
-User Query: {query}
+Write a clear, concise, human-friendly answer based only on this data.
+- Use actual numbers and facts from the data
+- Use bullet points if there are multiple rows
+- Do NOT mention SQL, tables, columns, or any technical details
+- If the data is empty or unclear, say so honestly
 """
 
     response = client.chat.completions.create(
@@ -42,53 +43,47 @@ User Query: {query}
         messages=[
             {
                 "role": "system",
-                "content": "You are a strict ERP intent classification system."
+                "content": "You are a helpful ERP business analyst. Summarize database results clearly for non-technical users."
             },
             {
                 "role": "user",
                 "content": prompt
             }
         ],
-        temperature=0
+        temperature=0.3
     )
+    print("AI Summary Response:", response.choices[0].message.content.strip())
 
     return response.choices[0].message.content.strip()
 
 
 # -----------------------------
-# 2. TOOL EXECUTION LAYER
-# -----------------------------
-def execute_tool(intent: str):
-    if intent == "total_sales":
-        return f"Total sales: {get_total_sales()}"
-
-    elif intent == "sales_by_region":
-        return get_sales_by_region()
-
-    elif intent == "total_leads":
-        return f"Total leads generated: {get_total_leads()}"
-
-    return None
-
-
-# -----------------------------
-# 3. MAIN AI SERVICE FUNCTION
+# MAIN AI SERVICE
+# Fully dynamic — no static intents or hardcoded SQL
 # -----------------------------
 def generate_response(role: str, query: str):
+    """
+    Flow:
+    1. Try to answer from the database (AI generates SQL from live schema)
+    2. If not DB-related, fall back to a general LLM response
+    """
 
-    # STEP 1: AI decides intent
-    intent = detect_intent_with_ai(role, query)
+    # STEP 1: AI reads live schema → generates SQL → runs it
+    sql_query = route_query(query)
 
-    # STEP 2: Execute ERP tool if applicable
-    tool_result = execute_tool(intent)
+    if sql_query:
+        data = run_sql(sql_query)
+        summary = summarize_data_with_ai(query, data, role)
 
-    if tool_result is not None:
         return {
-            "intent": intent,
-            "response": tool_result
+            "type": "sql",
+            "sql": sql_query,       # useful for debugging
+            "data": data,           # raw rows
+            "response": summary     # human-readable answer for UI
         }
+    print("No SQL generated, falling back to general LLM response.")
 
-    # STEP 3: fallback to general AI response
+    # STEP 2: Not DB-related → general LLM response
     system_prompt = get_system_prompt(role)
 
     response = client.chat.completions.create(
@@ -105,8 +100,9 @@ def generate_response(role: str, query: str):
         ],
         temperature=0.3
     )
+    print("General LLM Response:", response.choices[0].message.content.strip())
 
     return {
-        "intent": "general",
+        "type": "llm",
         "response": response.choices[0].message.content
     }
