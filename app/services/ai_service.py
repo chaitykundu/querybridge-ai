@@ -65,8 +65,15 @@ def generate_response(role: str, query: str):
     4. Fall back to general LLM if no SQL generated
     """
 
-    # STEP 1: Unpack tuple — sql may be None, db_name is always a string
-    sql, db_name = route_query(query)
+   # STEP 1: Unpack tuple — sql may be None, db_name is always a string, error is polite message or None
+    sql, db_name, error = route_query(query)
+
+    if error:
+        return {
+            "type": "error",
+            "response": error,
+            "data": None
+        }
 
     if sql:
         try:
@@ -79,10 +86,10 @@ def generate_response(role: str, query: str):
 
         return {
             "type": "sql",
-            "db": db_name,       # which database was queried
-            "query": sql,        # generated SQL for debugging
-            "data": data,        # raw rows
-            "response": summary  # human-readable answer
+            "db": db_name,
+            "query": sql,
+            "data": data,
+            "response": summary
         }
 
     print("[ai_service] No SQL generated — falling back to general LLM response.")

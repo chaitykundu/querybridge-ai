@@ -9,22 +9,30 @@ client = OpenAI(api_key=settings.OPENAI_API_KEY)
 # -----------------------------
 DATABASE_NAME_MAP = {
     "star snacks": "STRDAT",
-    "star snack": "STRDAT",
-    "kadouri": "KADDAT",
+    "star snack":  "STRDAT",
+    "kadouri":     "KADDAT",
     "supreme star": "TRIDAT",
-    "star spice": "SPCDAT",
-    "star": "STRDAT",
-    "samin": "SAMINC",      # ← was SAMINCS
-    "samin inc": "SAMINC",  # ← was SAMINCS
-    "saminc": "SAMINC",     # ← was SAMINCS
+    "star spice":  "SPCDAT",
+    "star":        "STRDAT",
+    "samin":       "SAMINC",
+    "samin inc":   "SAMINC",
+    "saminc":      "SAMINC",
+    "strdat":      "STRDAT",
+    "tridat":      "TRIDAT",
+    "spcdat":      "SPCDAT",
+    "kaddat":      "KADDAT",
 }
 
-DEFAULT_DATABASE = "SAMINC"  # ← was SAMINCS
+# Default DB when no company is detected in the query
+DEFAULT_DATABASE = "SAMINC"
 
 # -----------------------------
 # SCHEMA CACHE — per database
 # -----------------------------
 _schema_cache: dict[str, dict] = {}
+
+# Tracks DBs that failed to load so we don't retry them
+_unavailable_dbs: set[str] = set()
 
 
 # -----------------------------
@@ -78,19 +86,28 @@ def detect_database(user_query: str) -> str:
 # SCHEMA LOADER — cached per database
 # -----------------------------
 def get_full_schema(db_name: str) -> dict:
-    global _schema_cache
+    global _schema_cache, _unavailable_dbs
 
     if db_name in _schema_cache:
         return _schema_cache[db_name]
 
-    rows = execute_query_on_db(db_name, f"""
-        SELECT t.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE
-        FROM [{db_name}].INFORMATION_SCHEMA.TABLES t
-        JOIN [{db_name}].INFORMATION_SCHEMA.COLUMNS c
-          ON t.TABLE_NAME = c.TABLE_NAME
-        WHERE t.TABLE_TYPE = 'BASE TABLE'
-        ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION
-    """)
+    if db_name in _unavailable_dbs:
+        print(f"[get_full_schema] DB '{db_name}' is marked unavailable — skipping.")
+        return {}
+
+    try:
+        rows = execute_query_on_db(db_name, f"""
+            SELECT t.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE
+            FROM [{db_name}].INFORMATION_SCHEMA.TABLES t
+            JOIN [{db_name}].INFORMATION_SCHEMA.COLUMNS c
+              ON t.TABLE_NAME = c.TABLE_NAME
+            WHERE t.TABLE_TYPE = 'BASE TABLE'
+            ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION
+        """)
+    except Exception as e:
+        print(f"[get_full_schema] Cannot access DB '{db_name}': {e}")
+        _unavailable_dbs.add(db_name)
+        return {}
 
     schema = {}
     for row in rows:
@@ -106,10 +123,42 @@ def get_full_schema(db_name: str) -> dict:
 
 # -----------------------------
 # STEP 1: Pick relevant tables
+# Sends table name + all column names so LLM picks correctly
+# based on actual columns, not just table names
 # -----------------------------
+def build_table_summary(schema: dict, max_cols: int = 10) -> str:
+    """
+    Compact summary: TABLE_NAME: COL1, COL2, COL3 ...
+    Only sends first `max_cols` columns per table to stay within token limits.
+    """
+    lines = []
+    for table, cols in schema.items():
+        col_names = ", ".join(c.split(" ")[0] for c in cols[:max_cols])
+        lines.append(f"{table}: {col_names}")
+    return "\n".join(lines)
+
+
+def build_table_summary_chunked(schema: dict, max_tables: int = 50, max_cols: int = 10) -> str:
+    """
+    If schema has too many tables, only send the first max_tables.
+    Logs a warning if truncated.
+    """
+    keys = list(schema.keys())
+    if len(keys) > max_tables:
+        print(f"[build_table_summary] Schema has {len(keys)} tables — truncating to {max_tables} for token limit.")
+        keys = keys[:max_tables]
+
+    lines = []
+    for table in keys:
+        cols = schema[table]
+        col_names = ", ".join(c.split(" ")[0] for c in cols[:max_cols])
+        lines.append(f"{table}: {col_names}")
+    return "\n".join(lines)
+
+
 def pick_relevant_tables(user_query: str, db_name: str) -> list[str]:
     schema = get_full_schema(db_name)
-    table_names = "\n".join(schema.keys())
+    table_summary = build_table_summary(schema)
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -117,14 +166,21 @@ def pick_relevant_tables(user_query: str, db_name: str) -> list[str]:
             {
                 "role": "system",
                 "content": (
-                    "You are a database assistant. Given a user question and table names, "
-                    "reply with ONLY the relevant table names as a comma-separated list. "
-                    "If none are relevant, reply NULL."
+                    "You are a database schema expert. "
+                    "Given a user question and a list of tables with their exact column names, "
+                    "identify which tables contain the columns needed to answer the question. "
+                    "\n\nRules:"
+                    "\n- If the user mentions a word that matches a TABLE NAME exactly, that is the table to query."
+                    "\n- Choose tables that have columns matching what the user needs "
+                    "(e.g. amounts, dates, invoice numbers, sequences)."
+                    "\n- Do NOT pick a table just because its name sounds related — verify it has the right columns."
+                    "\n- Reply with ONLY the relevant table names as a comma-separated list."
+                    "\n- If no table fits, reply NULL."
                 )
             },
             {
                 "role": "user",
-                "content": f"Question: {user_query}\n\nAvailable tables:\n{table_names}"
+                "content": f"Question: {user_query}\n\nTables and their columns:\n{table_summary}"
             }
         ],
         temperature=0,
@@ -159,21 +215,30 @@ def get_schema_for_tables(table_names: list[str], db_name: str) -> str:
 
 # -----------------------------
 # MAIN ENTRY POINT
-# Returns (sql: str | None, db_name: str)
-# sql is None only if no relevant tables found or SQL generation failed
-# db_name is ALWAYS a valid string
+# Returns (sql, db_name, error)
+# - sql: generated SELECT query or None
+# - db_name: always a valid string
+# - error: polite error message or None
 # -----------------------------
-def route_query(user_query: str) -> tuple[str | None, str]:
+def route_query(user_query: str) -> tuple[str | None, str, str | None]:
     # Step 0: always resolves to a DB (never None)
     db_name = detect_database(user_query)
 
-    # Step 1: pick relevant tables
+    # Step 1: load schema — may fail gracefully if DB doesn't exist
+    schema = get_full_schema(db_name)
+    if not schema:
+        company = next((k for k, v in DATABASE_NAME_MAP.items() if v == db_name), db_name)
+        error_msg = f"The database for '{company}' is not available on the server. Please contact your administrator."
+        print(f"[route_query] DB '{db_name}' unavailable — returning polite error.")
+        return None, db_name, error_msg
+
+    # Step 2: pick relevant tables
     relevant_tables = pick_relevant_tables(user_query, db_name)
     if not relevant_tables:
         print(f"[route_query] No relevant tables found in {db_name}")
-        return None, db_name
+        return None, db_name, None
 
-    # Step 2: generate SQL
+    # Step 3: generate SQL using only real columns from real tables
     focused_schema = get_schema_for_tables(relevant_tables, db_name)
 
     response = client.chat.completions.create(
@@ -182,13 +247,15 @@ def route_query(user_query: str) -> tuple[str | None, str]:
             {
                 "role": "system",
                 "content": (
-                "You are a T-SQL expert for SQL Server. "
-                "Write only a valid SELECT query using fully qualified table names like [DB].[dbo].[TABLE]. "
-                "When a user mentions a number that looks like an invoice or sequence number, "
-                "use it to filter by the primary key or sequence column (e.g. INVHSEQ, INVSEQ, SEQ), "
-                "NOT by date or amount columns. "
-                "No explanation, no markdown, no backticks."
-            )
+                    "You are a T-SQL expert for SQL Server. "
+                    "Write only a valid SELECT query using fully qualified table names like [DB].[dbo].[TABLE]. "
+                    "RULES: "
+                    "1. Only use column names that exist in the schema provided — never guess or invent column names. "
+                    "2. If the user mentions a word matching a table name, use it as the FROM table, never as a WHERE filter value. "
+                    "3. If the user mentions a standalone number, filter by the primary key or sequence column (INVHSEQ, SEQ, etc), NOT by date or amount columns. "
+                    "4. For totals or best sellers, SUM the amount column directly — do not add wrong WHERE filters. "
+                    "5. No explanation, no markdown, no backticks."
+                )
             },
             {
                 "role": "user",
@@ -204,6 +271,6 @@ def route_query(user_query: str) -> tuple[str | None, str]:
     print(f"[route_query] DB: {db_name} | Generated SQL: {sql}")
 
     if not sql.upper().startswith("SELECT"):
-        return None, db_name
+        return None, db_name, None
 
-    return sql, db_name
+    return sql, db_name, None
