@@ -1,26 +1,94 @@
 from openai import OpenAI
 from app.core.config import settings
-from app.db.repository import execute_query
+from app.db.repository import execute_query, execute_query_on_db
 
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
-# Schema is loaded once and reused — never fetched again
-_schema_cache = None
+# -----------------------------
+# COMPANY → DATABASE MAP
+# -----------------------------
+DATABASE_NAME_MAP = {
+    "star snacks": "STRDAT",
+    "star snack": "STRDAT",
+    "kadouri": "KADDAT",
+    "supreme star": "TRIDAT",
+    "star spice": "SPCDAT",
+    "star": "STRDAT",
+    "samin": "SAMINC",      # ← was SAMINCS
+    "samin inc": "SAMINC",  # ← was SAMINCS
+    "saminc": "SAMINC",     # ← was SAMINCS
+}
+
+DEFAULT_DATABASE = "SAMINC"  # ← was SAMINCS
+
+# -----------------------------
+# SCHEMA CACHE — per database
+# -----------------------------
+_schema_cache: dict[str, dict] = {}
 
 
 # -----------------------------
-# SCHEMA LOADER — cached in memory
+# STEP 0: Detect company → database
 # -----------------------------
-def get_full_schema() -> dict:
+def detect_database(user_query: str) -> str:
+    """
+    Returns a database name. Always returns something —
+    falls back to DEFAULT_DATABASE if no company detected.
+    """
+    query_lower = user_query.lower()
+
+    # Longest match first to avoid partial hits
+    sorted_keys = sorted(DATABASE_NAME_MAP.keys(), key=len, reverse=True)
+    for alias in sorted_keys:
+        if alias in query_lower:
+            db = DATABASE_NAME_MAP[alias]
+            print(f"[detect_database] Matched alias '{alias}' → DB: {db}")
+            return db
+
+    # Fallback: ask LLM
+    aliases_list = ", ".join(DATABASE_NAME_MAP.keys())
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a company name extractor. Given a user question, "
+                    f"identify which company is being referred to from this list: {aliases_list}. "
+                    "Reply with ONLY the matched alias exactly as written, or NULL if none match."
+                )
+            },
+            {"role": "user", "content": user_query}
+        ],
+        temperature=0,
+        max_tokens=20
+    )
+
+    result = response.choices[0].message.content.strip().lower()
+    print(f"[detect_database] LLM detected alias: '{result}'")
+
+    if result == "null" or result not in DATABASE_NAME_MAP:
+        print(f"[detect_database] No match found — using default DB: {DEFAULT_DATABASE}")
+        return DEFAULT_DATABASE
+
+    return DATABASE_NAME_MAP[result]
+
+
+# -----------------------------
+# SCHEMA LOADER — cached per database
+# -----------------------------
+def get_full_schema(db_name: str) -> dict:
     global _schema_cache
-    if _schema_cache is not None:
-        return _schema_cache
 
-    rows = execute_query("""
+    if db_name in _schema_cache:
+        return _schema_cache[db_name]
+
+    rows = execute_query_on_db(db_name, f"""
         SELECT t.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE
-        FROM INFORMATION_SCHEMA.TABLES t
-        JOIN INFORMATION_SCHEMA.COLUMNS c ON t.TABLE_NAME = c.TABLE_NAME
-        WHERE t.TABLE_TYPE = 'BASE TABLE' AND t.TABLE_SCHEMA = 'dbo'
+        FROM [{db_name}].INFORMATION_SCHEMA.TABLES t
+        JOIN [{db_name}].INFORMATION_SCHEMA.COLUMNS c
+          ON t.TABLE_NAME = c.TABLE_NAME
+        WHERE t.TABLE_TYPE = 'BASE TABLE'
         ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION
     """)
 
@@ -31,22 +99,16 @@ def get_full_schema() -> dict:
             schema[table] = []
         schema[table].append(f"{row['COLUMN_NAME']} ({row['DATA_TYPE']})")
 
-    _schema_cache = schema
-    print(f"[Schema loaded] {len(schema)} tables cached.")
+    _schema_cache[db_name] = schema
+    print(f"[Schema loaded] DB: {db_name} → {len(schema)} tables cached.")
     return schema
 
 
-def get_schema_context() -> str:
-    schema = get_full_schema()
-    return f"Total tables: {len(schema)}\nTables: {', '.join(schema.keys())}"
-
-
 # -----------------------------
-# STEP 1: Send ONLY table names to AI
-# Tiny prompt ~500 tokens — AI picks relevant tables
+# STEP 1: Pick relevant tables
 # -----------------------------
-def pick_relevant_tables(user_query: str) -> list[str]:
-    schema = get_full_schema()
+def pick_relevant_tables(user_query: str, db_name: str) -> list[str]:
+    schema = get_full_schema(db_name)
     table_names = "\n".join(schema.keys())
 
     response = client.chat.completions.create(
@@ -70,41 +132,49 @@ def pick_relevant_tables(user_query: str) -> list[str]:
     )
 
     result = response.choices[0].message.content.strip()
-    print(f"[Table picker] Query: '{user_query}' → Tables: {result}")
+    print(f"[Table picker] DB: {db_name} | Query: '{user_query}' → Tables: {result}")
 
     if result.upper() == "NULL" or not result:
         return []
 
     picked = [t.strip() for t in result.split(",")]
     valid = [t for t in picked if t in schema]
-    return valid[:3]  # max 3 tables to keep tokens low
+    return valid[:3]
 
 
 # -----------------------------
-# STEP 2: Generate SQL with ONLY picked tables' columns
-# Focused prompt ~300 tokens
+# STEP 2: Build focused schema string
 # -----------------------------
-def get_schema_for_tables(table_names: list[str]) -> str:
-    schema = get_full_schema()
+def get_schema_for_tables(table_names: list[str], db_name: str) -> str:
+    schema = get_full_schema(db_name)
     lines = []
     for table in table_names:
         if table in schema:
-            lines.append(f"Table: {table}")
+            lines.append(f"Table: [{db_name}].[dbo].[{table}]")
             for col in schema[table]:
                 lines.append(f"  - {col}")
             lines.append("")
     return "\n".join(lines)
 
 
-def route_query(user_query: str) -> str | None:
-    # Step 1: which tables? (~500 tokens)
-    relevant_tables = pick_relevant_tables(user_query)
-    if not relevant_tables:
-        print("[route_query] No relevant tables found — falling back to LLM")
-        return None
+# -----------------------------
+# MAIN ENTRY POINT
+# Returns (sql: str | None, db_name: str)
+# sql is None only if no relevant tables found or SQL generation failed
+# db_name is ALWAYS a valid string
+# -----------------------------
+def route_query(user_query: str) -> tuple[str | None, str]:
+    # Step 0: always resolves to a DB (never None)
+    db_name = detect_database(user_query)
 
-    # Step 2: generate SQL with only those tables (~300 tokens)
-    focused_schema = get_schema_for_tables(relevant_tables)
+    # Step 1: pick relevant tables
+    relevant_tables = pick_relevant_tables(user_query, db_name)
+    if not relevant_tables:
+        print(f"[route_query] No relevant tables found in {db_name}")
+        return None, db_name
+
+    # Step 2: generate SQL
+    focused_schema = get_schema_for_tables(relevant_tables, db_name)
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -112,10 +182,13 @@ def route_query(user_query: str) -> str | None:
             {
                 "role": "system",
                 "content": (
-                    "You are a T-SQL expert for SQL Server. "
-                    "Write only a valid SELECT query. "
-                    "No explanation, no markdown, no backticks."
-                )
+                "You are a T-SQL expert for SQL Server. "
+                "Write only a valid SELECT query using fully qualified table names like [DB].[dbo].[TABLE]. "
+                "When a user mentions a number that looks like an invoice or sequence number, "
+                "use it to filter by the primary key or sequence column (e.g. INVHSEQ, INVSEQ, SEQ), "
+                "NOT by date or amount columns. "
+                "No explanation, no markdown, no backticks."
+            )
             },
             {
                 "role": "user",
@@ -128,9 +201,9 @@ def route_query(user_query: str) -> str | None:
 
     sql = response.choices[0].message.content.strip()
     sql = sql.replace("```sql", "").replace("```", "").strip()
-    print(f"[route_query] Generated SQL: {sql}")
+    print(f"[route_query] DB: {db_name} | Generated SQL: {sql}")
 
     if not sql.upper().startswith("SELECT"):
-        return None
+        return None, db_name
 
-    return sql
+    return sql, db_name

@@ -2,7 +2,7 @@ from openai import OpenAI
 from app.core.config import settings
 from app.prompts.system_prompt import get_system_prompt
 from app.services.query_router import route_query
-from app.services.sql_service import run_sql
+from app.db.repository import execute_query_on_db
 
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
@@ -11,9 +11,6 @@ client = OpenAI(api_key=settings.OPENAI_API_KEY)
 # CONVERT RAW DB RESULTS → HUMAN ANSWER
 # -----------------------------
 def summarize_data_with_ai(query: str, data: list, role: str) -> str:
-    """
-    Converts raw database rows into a natural language answer.
-    """
     if not data:
         return "No data was found in the database for your query."
 
@@ -53,35 +50,42 @@ Write a clear, concise, human-friendly answer based only on this data.
         temperature=0.3
     )
     print("AI Summary Response:", response.choices[0].message.content.strip())
-
     return response.choices[0].message.content.strip()
 
 
 # -----------------------------
 # MAIN AI SERVICE
-# Fully dynamic — no static intents or hardcoded SQL
 # -----------------------------
 def generate_response(role: str, query: str):
     """
     Flow:
-    1. Try to answer from the database (AI generates SQL from live schema)
-    2. If not DB-related, fall back to a general LLM response
+    1. route_query() returns (sql, db_name)
+    2. If sql exists, run it on the correct DB
+    3. Summarize results with AI
+    4. Fall back to general LLM if no SQL generated
     """
 
-    # STEP 1: AI reads live schema → generates SQL → runs it
-    sql_query = route_query(query)
+    # STEP 1: Unpack tuple — sql may be None, db_name is always a string
+    sql, db_name = route_query(query)
 
-    if sql_query:
-        data = run_sql(sql_query)
+    if sql:
+        try:
+            data = execute_query_on_db(db_name, sql)
+        except Exception as e:
+            print(f"[ai_service] DB error: {e}")
+            data = {"error": str(e)}
+
         summary = summarize_data_with_ai(query, data, role)
 
         return {
             "type": "sql",
-            "sql": sql_query,       # useful for debugging
-            "data": data,           # raw rows
-            "response": summary     # human-readable answer for UI
+            "db": db_name,       # which database was queried
+            "query": sql,        # generated SQL for debugging
+            "data": data,        # raw rows
+            "response": summary  # human-readable answer
         }
-    print("No SQL generated, falling back to general LLM response.")
+
+    print("[ai_service] No SQL generated — falling back to general LLM response.")
 
     # STEP 2: Not DB-related → general LLM response
     system_prompt = get_system_prompt(role)
@@ -89,14 +93,8 @@ def generate_response(role: str, query: str):
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": query
-            }
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query}
         ],
         temperature=0.3
     )
