@@ -1,11 +1,14 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
 from app.services.ai_service import generate_response
-from app.services.query_router import route_query, get_full_schema  # ← get_full_schema, not get_schema_context
-from app.services.sql_service import run_sql
+from app.services.query_router import route_query, get_full_schema
 
 router = APIRouter()
-chat_memory = {}  # In-memory chat history: { user_id: [ {role, content}, ... ] }
+
+# In-memory chat history: { user_id: [ {role, content}, ... ] }
+chat_memory: dict[str, list] = {}
+
+MAX_HISTORY = 20  # max messages to keep per user (10 turns)
 
 
 class ChatRequest(BaseModel):
@@ -16,48 +19,50 @@ class ChatRequest(BaseModel):
 
 @router.post("/chat")
 def chat_endpoint(request: ChatRequest):
-    # init memory
-    if request.user_id not in chat_memory:
-        chat_memory[request.user_id] = []
+    user_id = request.user_id
 
-    # 1. Save user message
-    chat_memory[request.user_id].append({
-        "role": "user",
-        "content": request.query
-    })
+    # Initialize history for new users
+    if user_id not in chat_memory:
+        chat_memory[user_id] = []
 
-    # 2. Generate response
+    history = chat_memory[user_id]
+
+    # Generate response — pass history BEFORE adding current user message
+    # so the current query isn't duplicated inside generate_response
     result = generate_response(
         role=request.role,
         query=request.query,
-        chat_history=chat_memory[request.user_id]
+        chat_history=history  # history of previous turns only
     )
 
-    # 3. ✅ SAVE ASSISTANT RESPONSE (THIS WAS MISSING)
-    if result.get("type") != "error":
-        chat_memory[request.user_id].append({
-            "role": "assistant",
-            "content": result.get("response")
-        })
+    # Save current turn to memory AFTER response
+    history.append({"role": "user", "content": request.query})
+    history.append({"role": "assistant", "content": result.get("response", "")})
 
-    # 4. (optional but important) limit memory
-    chat_memory[request.user_id] = chat_memory[request.user_id][-10:]
+    # Trim to max history
+    chat_memory[user_id] = history[-MAX_HISTORY:]
 
     return {
-        "user_id": request.user_id,
+        "user_id": user_id,
         "type": result.get("type"),
         "response": result.get("response"),
         "data": result.get("data"),
+        "query": result.get("query"),   # SQL for debugging
+        "db": result.get("db"),         # which DB was queried
     }
 
+
 # -------------------------------------------------------
-# DEBUG 1: Check if schema is loading correctly
-# GET http://localhost:8000/api/debug/schema
+# DEBUG: Check schema loading
+# GET /api/debug/schema?db=SAMINC
 # -------------------------------------------------------
+from fastapi import Query
+
 @router.get("/debug/schema")
-def debug_schema():
-    schema = get_full_schema()  # ← returns dict { table_name: [col1, col2, ...] }
+def debug_schema(db: str = Query(default="SAMINC")):
+    schema = get_full_schema(db)
     return {
+        "db": db,
         "table_count": len(schema),
         "tables": list(schema.keys()),
         "preview": {
@@ -67,8 +72,8 @@ def debug_schema():
 
 
 # -------------------------------------------------------
-# DEBUG 2: See what SQL is generated for a query
-# POST http://localhost:8000/api/debug/sql
+# DEBUG: See what SQL is generated for a query
+# POST /api/debug/sql
 # Body: { "query": "your question here" }
 # -------------------------------------------------------
 class DebugSQLRequest(BaseModel):
@@ -76,18 +81,52 @@ class DebugSQLRequest(BaseModel):
 
 @router.post("/debug/sql")
 def debug_sql(request: DebugSQLRequest):
-    sql = route_query(request.query)
+    sql, db_name, error = route_query(request.query)
+
+    if error:
+        return {"sql": None, "error": error}
 
     if not sql:
         return {
             "sql": None,
             "message": "AI could not generate SQL — falling back to LLM",
-            "fix": "Call GET /api/debug/schema to confirm tables loaded correctly"
+            "fix": "Call GET /api/debug/schema?db=SAMINC to confirm tables loaded correctly"
         }
 
-    data = run_sql(sql)
+    from app.db.repository import execute_query_on_db
+    try:
+        data = execute_query_on_db(db_name, sql)
+    except Exception as e:
+        return {"sql": sql, "db": db_name, "error": str(e)}
+
     return {
         "sql": sql,
+        "db": db_name,
         "row_count": len(data) if isinstance(data, list) else 0,
         "data_preview": data[:5] if isinstance(data, list) else data
     }
+
+
+# -------------------------------------------------------
+# DEBUG: View chat history for a user
+# GET /api/debug/history?user_id=user_001
+# -------------------------------------------------------
+@router.get("/debug/history")
+def debug_history(user_id: str = Query(...)):
+    history = chat_memory.get(user_id, [])
+    return {
+        "user_id": user_id,
+        "message_count": len(history),
+        "history": history
+    }
+
+
+# -------------------------------------------------------
+# Clear chat history for a user
+# DELETE /api/chat/history?user_id=user_001
+# -------------------------------------------------------
+@router.delete("/chat/history")
+def clear_history(user_id: str = Query(...)):
+    if user_id in chat_memory:
+        del chat_memory[user_id]
+    return {"user_id": user_id, "status": "history cleared"}

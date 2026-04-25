@@ -10,14 +10,19 @@ client = OpenAI(api_key=settings.OPENAI_API_KEY)
 # -----------------------------
 # CONVERT RAW DB RESULTS → HUMAN ANSWER
 # -----------------------------
-def summarize_data_with_ai(query: str, data: list, role: str, chat_history: list = []) -> str:
+def summarize_data_with_ai(query: str, data: list, role: str, chat_history: list = None) -> str:
+    if chat_history is None:
+        chat_history = []
+
     if not data:
-        return "No data was found in the database for your query."
+        return (
+            "I could not find relevant data to answer this. "
+            "Please try rephrasing your question or specify the table name (e.g. POINVJ, APCCS)."
+        )
 
     if isinstance(data, dict) and "error" in data:
         return f"There was a database error: {data['error']}"
 
-    # Limit rows sent to AI to avoid token overflow
     data_str = str(data[:50])
 
     prompt = f"""
@@ -33,6 +38,7 @@ Write a clear, concise, human-friendly answer based only on this data.
 - Use bullet points if there are multiple rows
 - Do NOT mention SQL, tables, columns, or any technical details
 - If the data is empty or unclear, say so honestly
+- NEVER invent or guess numbers not present in the data
 """
 
     response = client.chat.completions.create(
@@ -40,9 +46,9 @@ Write a clear, concise, human-friendly answer based only on this data.
         messages=[
             {
                 "role": "system",
-                "content": "You are a helpful ERP business analyst. Summarize database results clearly for non-technical users."
+                "content": "You are a helpful ERP business analyst. Summarize database results clearly for non-technical users. Never invent data."
             },
-            *chat_history, 
+            *chat_history,
             {
                 "role": "user",
                 "content": prompt
@@ -57,18 +63,14 @@ Write a clear, concise, human-friendly answer based only on this data.
 # -----------------------------
 # MAIN AI SERVICE
 # -----------------------------
-def generate_response(role: str, query: str, chat_history: list = []):
-    """
-    Flow:
-    1. route_query() returns (sql, db_name)
-    2. If sql exists, run it on the correct DB
-    3. Summarize results with AI
-    4. Fall back to general LLM if no SQL generated
-    """
+def generate_response(role: str, query: str, chat_history: list = None):
+    if chat_history is None:
+        chat_history = []
 
-   # STEP 1: Unpack tuple — sql may be None, db_name is always a string, error is polite message or None
+    # STEP 1: route_query returns (sql, db_name, error)
     sql, db_name, error = route_query(query)
 
+    # DB not available on server
     if error:
         return {
             "type": "error",
@@ -76,6 +78,7 @@ def generate_response(role: str, query: str, chat_history: list = []):
             "data": None
         }
 
+    # SQL was generated — run it
     if sql:
         try:
             data = execute_query_on_db(db_name, sql)
@@ -95,14 +98,14 @@ def generate_response(role: str, query: str, chat_history: list = []):
 
     print("[ai_service] No SQL generated — falling back to general LLM response.")
 
-    # STEP 2: Not DB-related → general LLM response
+    # STEP 2: No SQL — use LLM with history but strict no-hallucination rule
     system_prompt = get_system_prompt(role)
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system_prompt},
-                *chat_history,
+            *chat_history,
             {"role": "user", "content": query}
         ],
         temperature=0.3
