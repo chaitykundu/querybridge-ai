@@ -10,7 +10,7 @@ client = OpenAI(api_key=settings.OPENAI_API_KEY)
 # -----------------------------
 # CONVERT RAW DB RESULTS → HUMAN ANSWER
 # -----------------------------
-def summarize_data_with_ai(query: str, data: list, role: str) -> str:
+def summarize_data_with_ai(query: str, data: list, role: str, chat_history: list = []) -> str:
     if not data:
         return "No data was found in the database for your query."
 
@@ -42,6 +42,7 @@ Write a clear, concise, human-friendly answer based only on this data.
                 "role": "system",
                 "content": "You are a helpful ERP business analyst. Summarize database results clearly for non-technical users."
             },
+            *chat_history, 
             {
                 "role": "user",
                 "content": prompt
@@ -56,7 +57,7 @@ Write a clear, concise, human-friendly answer based only on this data.
 # -----------------------------
 # MAIN AI SERVICE
 # -----------------------------
-def generate_response(role: str, query: str):
+def generate_response(role: str, query: str, chat_history: list = []):
     """
     Flow:
     1. route_query() returns (sql, db_name)
@@ -82,7 +83,7 @@ def generate_response(role: str, query: str):
             print(f"[ai_service] DB error: {e}")
             data = {"error": str(e)}
 
-        summary = summarize_data_with_ai(query, data, role)
+        summary = summarize_data_with_ai(query, data, role, chat_history)
 
         return {
             "type": "sql",
@@ -101,6 +102,7 @@ def generate_response(role: str, query: str):
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system_prompt},
+                *chat_history,
             {"role": "user", "content": query}
         ],
         temperature=0.3
@@ -109,5 +111,5 @@ def generate_response(role: str, query: str):
 
     return {
         "type": "llm",
-        "response": response.choices[0].message.content
+        "response": response.choices[0].message.content.strip()
     }

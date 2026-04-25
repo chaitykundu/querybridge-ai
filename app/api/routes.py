@@ -5,6 +5,7 @@ from app.services.query_router import route_query, get_full_schema  # ← get_fu
 from app.services.sql_service import run_sql
 
 router = APIRouter()
+chat_memory = {}  # In-memory chat history: { user_id: [ {role, content}, ... ] }
 
 
 class ChatRequest(BaseModel):
@@ -15,7 +16,32 @@ class ChatRequest(BaseModel):
 
 @router.post("/chat")
 def chat_endpoint(request: ChatRequest):
-    result = generate_response(role=request.role, query=request.query)
+    # init memory
+    if request.user_id not in chat_memory:
+        chat_memory[request.user_id] = []
+
+    # 1. Save user message
+    chat_memory[request.user_id].append({
+        "role": "user",
+        "content": request.query
+    })
+
+    # 2. Generate response
+    result = generate_response(
+        role=request.role,
+        query=request.query,
+        chat_history=chat_memory[request.user_id]
+    )
+
+    # 3. ✅ SAVE ASSISTANT RESPONSE (THIS WAS MISSING)
+    if result.get("type") != "error":
+        chat_memory[request.user_id].append({
+            "role": "assistant",
+            "content": result.get("response")
+        })
+
+    # 4. (optional but important) limit memory
+    chat_memory[request.user_id] = chat_memory[request.user_id][-10:]
 
     return {
         "user_id": request.user_id,
@@ -23,7 +49,6 @@ def chat_endpoint(request: ChatRequest):
         "response": result.get("response"),
         "data": result.get("data"),
     }
-
 
 # -------------------------------------------------------
 # DEBUG 1: Check if schema is loading correctly
