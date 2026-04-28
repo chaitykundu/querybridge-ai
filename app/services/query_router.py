@@ -1,6 +1,9 @@
 from openai import OpenAI
 from app.core.config import settings
 from app.db.repository import execute_query, execute_query_on_db
+from app.services.schema_service import get_schema
+from app.services.sql_validator import validate_aggregation
+import re
 
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
@@ -109,12 +112,39 @@ def get_full_schema(db_name: str) -> dict:
         _unavailable_dbs.add(db_name)
         return {}
 
+    def infer_role(col_name: str):
+        c = col_name.upper()
+
+        if "DATE" in c:
+            return "date"
+        if c.startswith("AMT") or "TOTAL" in c or "PRICE" in c:
+            return "amount"
+        if "QTY" in c:
+            return "quantity"
+        if "CUST" in c:
+            return "customer"
+        if "VEND" in c:
+            return "vendor"
+        if "NAME" in c:
+            return "name"
+
+        return "other"
+
+
     schema = {}
+
     for row in rows:
         table = row["TABLE_NAME"]
+        col = row["COLUMN_NAME"]
+        dtype = row["DATA_TYPE"]
+
         if table not in schema:
-            schema[table] = []
-        schema[table].append(f"{row['COLUMN_NAME']} ({row['DATA_TYPE']})")
+            schema[table] = {}
+
+        schema[table][col] = {
+            "type": dtype.lower(),
+            "role": infer_role(col)
+        }
 
     _schema_cache[db_name] = schema
     print(f"[Schema loaded] DB: {db_name} → {len(schema)} tables cached.")
@@ -133,7 +163,8 @@ def build_table_summary(schema: dict, max_cols: int = 10) -> str:
     """
     lines = []
     for table, cols in schema.items():
-        col_names = ", ".join(c.split(" ")[0] for c in cols[:max_cols])
+        #col_names = ", ".join(c.split(" ")[0] for c in cols[:max_cols])
+        col_names = ", ".join(list(cols.keys())[:max_cols])
         lines.append(f"{table}: {col_names}")
     return "\n".join(lines)
 
@@ -207,8 +238,11 @@ def get_schema_for_tables(table_names: list[str], db_name: str) -> str:
     for table in table_names:
         if table in schema:
             lines.append(f"Table: [{db_name}].[dbo].[{table}]")
-            for col in schema[table]:
-                lines.append(f"  - {col}")
+            # for col in schema[table]:
+            #     lines.append(f"  - {col}")
+            for col, meta in schema[table].items():
+                lines.append(f"  - {col} ({meta['type']})")
+        
             lines.append("")
     return "\n".join(lines)
 
@@ -272,5 +306,9 @@ def route_query(user_query: str) -> tuple[str | None, str, str | None]:
 
     if not sql.upper().startswith("SELECT"):
         return None, db_name, None
+
+    if "SUM(AUDTDATE)" in sql.upper():
+        print("[Validator] Invalid SQL detected")
+        return None, db_name, "Invalid aggregation on date column."
 
     return sql, db_name, None

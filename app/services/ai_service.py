@@ -17,7 +17,7 @@ def summarize_data_with_ai(query: str, data: list, role: str, chat_history: list
     if not data:
         return (
             "I could not find relevant data to answer this. "
-            "Please try rephrasing your question or specify the table name (e.g. POINVJ, APCCS)."
+            "Please try rephrasing your question or specify the database name (e.g. saminc, stars)."
         )
 
     if isinstance(data, dict) and "error" in data:
