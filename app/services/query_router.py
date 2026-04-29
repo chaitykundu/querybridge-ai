@@ -20,6 +20,15 @@ DATABASE_NAME_MAP = {
     "kaddat":       "KADDAT",
 }
 
+# ← ADD RIGHT HERE ↓
+DB_DISPLAY_NAME = {
+    "SAMINC": "Samin Inc",
+    "STRDAT": "Star Snacks",
+    "TRIDAT": "Supreme Star",
+    "SPCDAT": "Star Spice",
+    "KADDAT": "Kadouri",
+}
+
 DEFAULT_DATABASE = "SAMINC"
 
 _schema_cache: dict[str, dict] = {}
@@ -73,16 +82,19 @@ def get_full_schema(db_name: str) -> dict:
             JOIN [{db_name}].INFORMATION_SCHEMA.COLUMNS c
               ON t.TABLE_NAME = c.TABLE_NAME
             WHERE t.TABLE_TYPE = 'BASE TABLE'
-            ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION
+            ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION  -- ✅ preserve real column order
         """)
     except Exception as e:
         print(f"[get_full_schema] Cannot access DB '{db_name}': {e}")
         _unavailable_dbs.add(db_name)
         return {}
 
+    # ✅ Use dict to preserve insertion order (Python 3.7+)
     schema: dict = {}
     for row in rows:
-        schema.setdefault(row["TABLE_NAME"], {})[row["COLUMN_NAME"]] = {
+        table = row["TABLE_NAME"]
+        col = row["COLUMN_NAME"]
+        schema.setdefault(table, {})[col] = {
             "type": row["DATA_TYPE"].lower()
         }
 
@@ -102,40 +114,73 @@ def get_full_schema(db_name: str) -> dict:
 # Maps common query words → substrings that appear in your ERP table names.
 # Extend this list based on your actual table naming conventions.
 QUERY_WORD_TO_TABLE_HINT: dict[str, list[str]] = {
-    "sale":     ["SALE", "SLSS", "INVH", "SINV"],
-    "sales":    ["SALE", "SLSS", "INVH", "SINV"],
-    "seller":   ["SALE", "SLSS", "CUST", "ITEM"],
-    "best":     ["SALE", "SLSS", "CUST", "ITEM"],
-    "top":      ["SALE", "SLSS", "CUST", "ITEM"],
-    "invoice":  ["INVH", "INVD", "INV"],
-    "invoices": ["INVH", "INVD", "INV"],
-    "customer": ["CUST"],
-    "customers":["CUST"],
-    "vendor":   ["VEND", "SUPP"],
-    "vendors":  ["VEND", "SUPP"],
-    "item":     ["ITEM", "PROD"],
-    "items":    ["ITEM", "PROD"],
-    "product":  ["ITEM", "PROD"],
-    "purchase": ["PORD", "PURCH", "PORC"],
-    "order":    ["ORDR", "PORD"],
-    "payment":  ["RCPT", "PAY"],
-    "stock":    ["STCK", "INVT", "WHSE"],
-    "inventory":["INVT", "STCK", "WHSE"],
-    "account":  ["ACCT", "GL"],
-    "ledger":   ["GL", "LEDG"],
-    "employee": ["EMP", "HR"],
+    # Accounts Payable
+    "vendor":       ["AP"],
+    "vendors":      ["AP"],
+    "payable":      ["AP"],
+    "payment":      ["AP"],
+    "payments":     ["AP"],
+    "purchase":     ["AP", "PO"],
+    "purchases":    ["AP", "PO"],
+    "bill":         ["AP"],
+    "bills":        ["AP"],
+
+    # Accounts Receivable
+    "customer":     ["AR"],
+    "customers":    ["AR"],
+    "receivable":   ["AR"],
+    "receipt":      ["AR"],
+    "receipts":     ["AR"],
+    "invoice":      ["AR", "OE"],
+    "invoices":     ["AR", "OE"],
+    "outstanding":  ["AR"],
+    "due":          ["AR"],
+
+    # Order Entry / Sales
+    "sale":         ["OE", "AR"],
+    "sales":        ["OE", "AR"],
+    "order":        ["OE"],
+    "orders":       ["OE"],
+    "shipment":     ["OE"],
+    "shipments":    ["OE"],
+    "seller":       ["OE", "AR"],
+    "best":         ["OE", "AR"],
+    "top":          ["OE", "AR"],
+
+    # Inventory Control
+    "inventory":    ["IC"],
+    "stock":        ["IC"],
+    "item":         ["IC"],
+    "items":        ["IC"],
+    "product":      ["IC"],
+    "products":     ["IC"],
+    "warehouse":    ["IC"],
+
+    # Purchase Orders
+    "po":           ["PO"],
+    "purchasing":   ["PO", "AP"],
+
+    # General Ledger
+    "ledger":       ["GL"],
+    "account":      ["GL"],
+    "accounts":     ["GL"],
+    "journal":      ["GL"],
+    "balance":      ["GL"],
+    "financial":    ["GL"],
+    "expense":      ["GL", "AP"],
+
+    # Payroll / HR
+    "employee":     ["PR", "HR"],
+    "employees":    ["PR", "HR"],
+    "payroll":      ["PR"],
+    "salary":       ["PR"],
+    "salaries":     ["PR"],
 }
 
 def filter_tables_by_keywords(user_query: str, schema: dict) -> dict:
-    """
-    Pure Python — zero LLM calls, zero tokens.
-    Matches query words against table name substrings.
-    Returns a filtered schema dict with only relevant tables.
-    """
     query_words = user_query.lower().split()
     hints: set[str] = set()
 
-    # Collect all table-name hints that match any word in the query
     for word in query_words:
         if word in QUERY_WORD_TO_TABLE_HINT:
             hints.update(QUERY_WORD_TO_TABLE_HINT[word])
@@ -144,16 +189,15 @@ def filter_tables_by_keywords(user_query: str, schema: dict) -> dict:
 
     if hints:
         for table in schema:
-            table_upper = table.upper()
-            if any(hint in table_upper for hint in hints):
+            # Match by PREFIX instead of substring
+            if any(table.upper().startswith(hint) for hint in hints):
                 matched[table] = schema[table]
 
-    # Fallback: if no hint matched, try raw word-in-table-name scan
+    # Fallback
     if not matched:
         meaningful_words = [w for w in query_words if len(w) > 3]
         for table in schema:
-            table_upper = table.upper()
-            if any(w.upper() in table_upper for w in meaningful_words):
+            if any(w.upper() in table.upper() for w in meaningful_words):
                 matched[table] = schema[table]
 
     print(f"[filter_tables] {len(schema)} → {len(matched)} tables after keyword filter.")
@@ -175,20 +219,24 @@ def _col_score(col: str) -> int:
     u = col.upper()
     return sum(1 for kw in _PRIORITY_KEYWORDS if kw in u)
 
-def build_ultra_compact_schema(db_name: str, schema: dict, max_cols: int = 5) -> str:
-    """
-    One line per table, top-scored columns only, no types.
-    TABLE_NAME: COL1 COL2 COL3
-    ~5-10 tokens per table instead of 30-50.
-    """
+def build_ultra_compact_schema(db_name: str, schema: dict, max_cols: int = 30) -> str:
     lines = []
     for table, cols in schema.items():
-        top = sorted(cols.keys(), key=_col_score, reverse=True)[:max_cols]
-        # Fully qualified so LLM can use directly in SQL
+        # REMOVE the sorted/scoring — just take columns in original order
+        top = list(cols.keys())[:max_cols]  # ← changed this line
         fq = f"[{db_name}].[dbo].[{table}]"
         lines.append(f"{fq}: {' '.join(top)}")
     return "\n".join(lines)
 
+# ← ADD RIGHT HERE ↓
+def get_table_sample(db_name: str, table: str) -> str:
+    try:
+        rows = execute_query_on_db(db_name, f"SELECT TOP 2 * FROM [{db_name}].[dbo].[{table}]")
+        if rows:
+            return str(rows)
+    except:
+        pass
+    return ""
 
 # -----------------------------
 # MAIN ENTRY POINT — 2 steps only: detect DB → generate SQL
@@ -200,6 +248,8 @@ def route_query(user_query: str) -> tuple[str | None, str, str | None]:
 
     # Step 1: load full schema (cached after first call)
     schema = get_full_schema(db_name)
+    # ADD THIS TO SEE YOUR REAL TABLE NAMES
+    print("[DEBUG] Sample tables:", list(schema.keys())[:30])
     if not schema:
         company = next((k for k, v in DATABASE_NAME_MAP.items() if v == db_name), db_name)
         return None, db_name, (
@@ -214,7 +264,15 @@ def route_query(user_query: str) -> tuple[str | None, str, str | None]:
         return None, db_name, None
 
     # Step 3: build compact schema and generate SQL in ONE LLM call
-    compact_schema = build_ultra_compact_schema(db_name, filtered)
+    compact_schema = build_ultra_compact_schema(db_name, filtered, max_cols=30)
+
+    # Add real sample data for top 3 tables
+    sample_lines = []
+    for table in list(filtered.keys())[:3]:
+        sample = get_table_sample(db_name, table)
+        if sample:
+            sample_lines.append(f"Sample from {table}:\n{sample}")
+    sample_text = "\n\n".join(sample_lines)
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -222,27 +280,21 @@ def route_query(user_query: str) -> tuple[str | None, str, str | None]:
             {
                 "role": "system",
                 "content": (
-                    "You are a T-SQL expert for SQL Server.\n"
+                    "You are a T-SQL expert for Sage 300 ERP on SQL Server.\n"
                     "You generate correct SQL based on BUSINESS MEANING, not just column names.\n\n"
 
-                    "You are given:\n"
-                    "1. A schema with tables and columns\n"
-                    "2. OPTIONAL business meaning of columns (VERY IMPORTANT)\n\n"
-
                     "RULES:\n"
-                    "1. Only use columns from schema.\n"
-                    "2. Always interpret queries in BUSINESS TERMS first (sales, customers, invoices, payments).\n"
-                    "3. If multiple tables exist, choose joins only when business relationship is logical.\n"
-                    "4. NEVER assume column meaning unless explicitly stated.\n"
-                    "5. 'top/best seller' means highest SUM(quantity or amount related to sales).\n"
-                    "6. Avoid incorrect aggregations on unrelated fields (dates, IDs, codes).\n"
-                    "7. Return ONLY valid SQL Server query.\n"
-                    "8. No explanation, no markdown.\n"
+                    "1. Only use columns that exist in the schema provided.\n"
+                    "2. Always interpret queries in BUSINESS TERMS first.\n"
+                    "3. Use the real data samples to understand what values and column names actually exist.\n"
+                    "4. NEVER guess or invent column names — only use columns visible in the schema.\n"
+                    "5. Return ONLY valid SQL Server query.\n"
+                    "6. No explanation, no markdown.\n"
                 )
             },
             {
                 "role": "user",
-                "content": f"Schema:\n{compact_schema}\n\nQuestion: {user_query}\n\nSQL:"
+                "content": f"Schema:\n{compact_schema}\n\nReal Data Samples:\n{sample_text}\n\nQuestion: {user_query}\n\nSQL:"  # ← added sample_text
             }
         ],
         temperature=0,

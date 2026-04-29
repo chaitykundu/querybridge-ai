@@ -1,7 +1,7 @@
 from openai import OpenAI
 from app.core.config import settings
 from app.prompts.system_prompt import get_system_prompt
-from app.services.query_router import route_query
+from app.services.query_router import route_query, DB_DISPLAY_NAME
 from app.db.repository import execute_query_on_db
 
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
@@ -10,7 +10,7 @@ client = OpenAI(api_key=settings.OPENAI_API_KEY)
 # -----------------------------
 # CONVERT RAW DB RESULTS → HUMAN ANSWER
 # -----------------------------
-def summarize_data_with_ai(query: str, data: list, role: str, chat_history: list = None) -> str:
+def summarize_data_with_ai(query: str, data: list, role: str, db_name: str="", chat_history: list = None) -> str:
     if chat_history is None:
         chat_history = []
 
@@ -29,6 +29,7 @@ def summarize_data_with_ai(query: str, data: list, role: str, chat_history: list
 You are a helpful ERP assistant responding to a {role}.
 
 The user asked: "{query}"
+Data source: Company database — {db_name}   # ← ADD THIS LINE
 
 The database returned this data:
 {data_str}
@@ -67,35 +68,29 @@ def generate_response(role: str, query: str, chat_history: list = None):
     if chat_history is None:
         chat_history = []
 
-    # STEP 1: route_query returns (sql, db_name, error)
     sql, db_name, error = route_query(query)
+    
+    display_name = DB_DISPLAY_NAME.get(db_name, db_name)  # friendly name for display only
 
-    # DB not available on server
     if error:
-        return {
-            "type": "error",
-            "response": error,
-            "data": None
-        }
+        return {"type": "error", "response": error, "data": None}
 
-    # SQL was generated — run it
     if sql:
         try:
-            data = execute_query_on_db(db_name, sql)
+            data = execute_query_on_db(db_name, sql)  # use raw db_name for DB connection
+            print("[DEBUG] Query result:", data[:3]) 
         except Exception as e:
-            print(f"[ai_service] DB error: {e}")
             data = {"error": str(e)}
 
-        summary = summarize_data_with_ai(query, data, role, chat_history)
+        summary = summarize_data_with_ai(query, data, role, display_name, chat_history)  # use display_name here
 
         return {
             "type": "sql",
-            "db": db_name,
+            "db": display_name,  # friendly name in response
             "query": sql,
             "data": data,
             "response": summary
         }
-
     print("[ai_service] No SQL generated — falling back to general LLM response.")
 
     # STEP 2: No SQL — use LLM with history but strict no-hallucination rule
