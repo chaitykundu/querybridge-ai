@@ -1,101 +1,69 @@
 from openai import OpenAI
 from app.core.config import settings
-from app.db.repository import execute_query, execute_query_on_db
-from app.services.schema_service import get_schema
-from app.services.sql_validator import validate_aggregation
-import re
+from app.db.repository import execute_query_on_db
 
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
-# -----------------------------
-# COMPANY → DATABASE MAP
-# -----------------------------
 DATABASE_NAME_MAP = {
-    "star snacks": "STRDAT",
-    "star snack":  "STRDAT",
-    "kadouri":     "KADDAT",
+    "star snacks":  "STRDAT",
+    "star snack":   "STRDAT",
+    "kadouri":      "KADDAT",
     "supreme star": "TRIDAT",
-    "star spice":  "SPCDAT",
-    "star":        "STRDAT",
-    "samin":       "SAMINC",
-    "samin inc":   "SAMINC",
-    "saminc":      "SAMINC",
-    "strdat":      "STRDAT",
-    "tridat":      "TRIDAT",
-    "spcdat":      "SPCDAT",
-    "kaddat":      "KADDAT",
+    "star spice":   "SPCDAT",
+    "star":         "STRDAT",
+    "samin":        "SAMINC",
+    "samin inc":    "SAMINC",
+    "saminc":       "SAMINC",
+    "strdat":       "STRDAT",
+    "tridat":       "TRIDAT",
+    "spcdat":       "SPCDAT",
+    "kaddat":       "KADDAT",
 }
 
-# Default DB when no company is detected in the query
 DEFAULT_DATABASE = "SAMINC"
 
-# -----------------------------
-# SCHEMA CACHE — per database
-# -----------------------------
 _schema_cache: dict[str, dict] = {}
-
-# Tracks DBs that failed to load so we don't retry them
 _unavailable_dbs: set[str] = set()
 
 
 # -----------------------------
-# STEP 0: Detect company → database
+# STEP 0: Detect database
 # -----------------------------
 def detect_database(user_query: str) -> str:
-    """
-    Returns a database name. Always returns something —
-    falls back to DEFAULT_DATABASE if no company detected.
-    """
     query_lower = user_query.lower()
-
-    # Longest match first to avoid partial hits
-    sorted_keys = sorted(DATABASE_NAME_MAP.keys(), key=len, reverse=True)
-    for alias in sorted_keys:
+    for alias in sorted(DATABASE_NAME_MAP.keys(), key=len, reverse=True):
         if alias in query_lower:
             db = DATABASE_NAME_MAP[alias]
-            print(f"[detect_database] Matched alias '{alias}' → DB: {db}")
+            print(f"[detect_database] Matched '{alias}' → {db}")
             return db
 
-    # Fallback: ask LLM
-    aliases_list = ", ".join(DATABASE_NAME_MAP.keys())
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "You are a company name extractor. Given a user question, "
-                    f"identify which company is being referred to from this list: {aliases_list}. "
-                    "Reply with ONLY the matched alias exactly as written, or NULL if none match."
+                    f"Identify which company from: {', '.join(DATABASE_NAME_MAP.keys())}. "
+                    "Reply ONLY with the matched alias or NULL."
                 )
             },
             {"role": "user", "content": user_query}
         ],
-        temperature=0,
-        max_tokens=20
+        temperature=0, max_tokens=20
     )
-
     result = response.choices[0].message.content.strip().lower()
-    print(f"[detect_database] LLM detected alias: '{result}'")
-
     if result == "null" or result not in DATABASE_NAME_MAP:
-        print(f"[detect_database] No match found — using default DB: {DEFAULT_DATABASE}")
         return DEFAULT_DATABASE
-
     return DATABASE_NAME_MAP[result]
 
 
 # -----------------------------
-# SCHEMA LOADER — cached per database
+# STEP 1: Load full schema — cached
 # -----------------------------
 def get_full_schema(db_name: str) -> dict:
-    global _schema_cache, _unavailable_dbs
-
     if db_name in _schema_cache:
         return _schema_cache[db_name]
-
     if db_name in _unavailable_dbs:
-        print(f"[get_full_schema] DB '{db_name}' is marked unavailable — skipping.")
         return {}
 
     try:
@@ -112,38 +80,10 @@ def get_full_schema(db_name: str) -> dict:
         _unavailable_dbs.add(db_name)
         return {}
 
-    def infer_role(col_name: str):
-        c = col_name.upper()
-
-        if "DATE" in c:
-            return "date"
-        if c.startswith("AMT") or "TOTAL" in c or "PRICE" in c:
-            return "amount"
-        if "QTY" in c:
-            return "quantity"
-        if "CUST" in c:
-            return "customer"
-        if "VEND" in c:
-            return "vendor"
-        if "NAME" in c:
-            return "name"
-
-        return "other"
-
-
-    schema = {}
-
+    schema: dict = {}
     for row in rows:
-        table = row["TABLE_NAME"]
-        col = row["COLUMN_NAME"]
-        dtype = row["DATA_TYPE"]
-
-        if table not in schema:
-            schema[table] = {}
-
-        schema[table][col] = {
-            "type": dtype.lower(),
-            "role": infer_role(col)
+        schema.setdefault(row["TABLE_NAME"], {})[row["COLUMN_NAME"]] = {
+            "type": row["DATA_TYPE"].lower()
         }
 
     _schema_cache[db_name] = schema
@@ -152,128 +92,129 @@ def get_full_schema(db_name: str) -> dict:
 
 
 # -----------------------------
-# STEP 1: Pick relevant tables
-# Sends table name + all column names so LLM picks correctly
-# based on actual columns, not just table names
+# STEP 2: Keyword-filter tables in pure Python — NO LLM, NO tokens
+#
+# Query words are matched against table names directly.
+# e.g. "best seller" → matches tables containing SALE, SLSS, CUST, ITEM
+# This cuts 1051 tables down to ~10-30 relevant ones before any LLM call.
 # -----------------------------
-def build_table_summary(schema: dict, max_cols: int = 10) -> str:
+
+# Maps common query words → substrings that appear in your ERP table names.
+# Extend this list based on your actual table naming conventions.
+QUERY_WORD_TO_TABLE_HINT: dict[str, list[str]] = {
+    "sale":     ["SALE", "SLSS", "INVH", "SINV"],
+    "sales":    ["SALE", "SLSS", "INVH", "SINV"],
+    "seller":   ["SALE", "SLSS", "CUST", "ITEM"],
+    "best":     ["SALE", "SLSS", "CUST", "ITEM"],
+    "top":      ["SALE", "SLSS", "CUST", "ITEM"],
+    "invoice":  ["INVH", "INVD", "INV"],
+    "invoices": ["INVH", "INVD", "INV"],
+    "customer": ["CUST"],
+    "customers":["CUST"],
+    "vendor":   ["VEND", "SUPP"],
+    "vendors":  ["VEND", "SUPP"],
+    "item":     ["ITEM", "PROD"],
+    "items":    ["ITEM", "PROD"],
+    "product":  ["ITEM", "PROD"],
+    "purchase": ["PORD", "PURCH", "PORC"],
+    "order":    ["ORDR", "PORD"],
+    "payment":  ["RCPT", "PAY"],
+    "stock":    ["STCK", "INVT", "WHSE"],
+    "inventory":["INVT", "STCK", "WHSE"],
+    "account":  ["ACCT", "GL"],
+    "ledger":   ["GL", "LEDG"],
+    "employee": ["EMP", "HR"],
+}
+
+def filter_tables_by_keywords(user_query: str, schema: dict) -> dict:
     """
-    Compact summary: TABLE_NAME: COL1, COL2, COL3 ...
-    Only sends first `max_cols` columns per table to stay within token limits.
+    Pure Python — zero LLM calls, zero tokens.
+    Matches query words against table name substrings.
+    Returns a filtered schema dict with only relevant tables.
+    """
+    query_words = user_query.lower().split()
+    hints: set[str] = set()
+
+    # Collect all table-name hints that match any word in the query
+    for word in query_words:
+        if word in QUERY_WORD_TO_TABLE_HINT:
+            hints.update(QUERY_WORD_TO_TABLE_HINT[word])
+
+    matched: dict = {}
+
+    if hints:
+        for table in schema:
+            table_upper = table.upper()
+            if any(hint in table_upper for hint in hints):
+                matched[table] = schema[table]
+
+    # Fallback: if no hint matched, try raw word-in-table-name scan
+    if not matched:
+        meaningful_words = [w for w in query_words if len(w) > 3]
+        for table in schema:
+            table_upper = table.upper()
+            if any(w.upper() in table_upper for w in meaningful_words):
+                matched[table] = schema[table]
+
+    print(f"[filter_tables] {len(schema)} → {len(matched)} tables after keyword filter.")
+    return matched
+
+
+# -----------------------------
+# STEP 3: Build ultra-compact schema string
+# Format: TABLE: COL1 COL2 COL3 (no types, no punctuation = fewer tokens)
+# Only the first N columns per table — sorted by business relevance
+# -----------------------------
+_PRIORITY_KEYWORDS = (
+    "SEQ", "NO", "NUM", "CODE", "NAME", "DATE", "AMT",
+    "TOTAL", "QTY", "PRICE", "CUST", "VEND", "ITEM",
+    "PROD", "INV", "SALE", "DESC", "TYPE", "ID",
+)
+
+def _col_score(col: str) -> int:
+    u = col.upper()
+    return sum(1 for kw in _PRIORITY_KEYWORDS if kw in u)
+
+def build_ultra_compact_schema(db_name: str, schema: dict, max_cols: int = 5) -> str:
+    """
+    One line per table, top-scored columns only, no types.
+    TABLE_NAME: COL1 COL2 COL3
+    ~5-10 tokens per table instead of 30-50.
     """
     lines = []
     for table, cols in schema.items():
-        #col_names = ", ".join(c.split(" ")[0] for c in cols[:max_cols])
-        col_names = ", ".join(list(cols.keys())[:max_cols])
-        lines.append(f"{table}: {col_names}")
-    return "\n".join(lines)
-
-
-def build_table_summary_chunked(schema: dict, max_tables: int = 50, max_cols: int = 10) -> str:
-    """
-    If schema has too many tables, only send the first max_tables.
-    Logs a warning if truncated.
-    """
-    keys = list(schema.keys())
-    if len(keys) > max_tables:
-        print(f"[build_table_summary] Schema has {len(keys)} tables — truncating to {max_tables} for token limit.")
-        keys = keys[:max_tables]
-
-    lines = []
-    for table in keys:
-        cols = schema[table]
-        col_names = ", ".join(c.split(" ")[0] for c in cols[:max_cols])
-        lines.append(f"{table}: {col_names}")
-    return "\n".join(lines)
-
-
-def pick_relevant_tables(user_query: str, db_name: str) -> list[str]:
-    schema = get_full_schema(db_name)
-    table_summary = build_table_summary(schema)
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a database schema expert. "
-                    "Given a user question and a list of tables with their exact column names, "
-                    "identify which tables contain the columns needed to answer the question. "
-                    "\n\nRules:"
-                    "\n- If the user mentions a word that matches a TABLE NAME exactly, that is the table to query."
-                    "\n- Choose tables that have columns matching what the user needs "
-                    "(e.g. amounts, dates, invoice numbers, sequences)."
-                    "\n- Do NOT pick a table just because its name sounds related — verify it has the right columns."
-                    "\n- Reply with ONLY the relevant table names as a comma-separated list."
-                    "\n- If no table fits, reply NULL."
-                )
-            },
-            {
-                "role": "user",
-                "content": f"Question: {user_query}\n\nTables and their columns:\n{table_summary}"
-            }
-        ],
-        temperature=0,
-        max_tokens=50
-    )
-
-    result = response.choices[0].message.content.strip()
-    print(f"[Table picker] DB: {db_name} | Query: '{user_query}' → Tables: {result}")
-
-    if result.upper() == "NULL" or not result:
-        return []
-
-    picked = [t.strip() for t in result.split(",")]
-    valid = [t for t in picked if t in schema]
-    return valid[:3]
-
-
-# -----------------------------
-# STEP 2: Build focused schema string
-# -----------------------------
-def get_schema_for_tables(table_names: list[str], db_name: str) -> str:
-    schema = get_full_schema(db_name)
-    lines = []
-    for table in table_names:
-        if table in schema:
-            lines.append(f"Table: [{db_name}].[dbo].[{table}]")
-            # for col in schema[table]:
-            #     lines.append(f"  - {col}")
-            for col, meta in schema[table].items():
-                lines.append(f"  - {col} ({meta['type']})")
-        
-            lines.append("")
+        top = sorted(cols.keys(), key=_col_score, reverse=True)[:max_cols]
+        # Fully qualified so LLM can use directly in SQL
+        fq = f"[{db_name}].[dbo].[{table}]"
+        lines.append(f"{fq}: {' '.join(top)}")
     return "\n".join(lines)
 
 
 # -----------------------------
-# MAIN ENTRY POINT
-# Returns (sql, db_name, error)
-# - sql: generated SELECT query or None
-# - db_name: always a valid string
-# - error: polite error message or None
+# MAIN ENTRY POINT — 2 steps only: detect DB → generate SQL
+# No table picker. No second LLM call. One prompt does everything.
 # -----------------------------
 def route_query(user_query: str) -> tuple[str | None, str, str | None]:
-    # Step 0: always resolves to a DB (never None)
+    # Step 0: which database?
     db_name = detect_database(user_query)
 
-    # Step 1: load schema — may fail gracefully if DB doesn't exist
+    # Step 1: load full schema (cached after first call)
     schema = get_full_schema(db_name)
     if not schema:
         company = next((k for k, v in DATABASE_NAME_MAP.items() if v == db_name), db_name)
-        error_msg = f"The database for '{company}' is not available on the server. Please contact your administrator."
-        print(f"[route_query] DB '{db_name}' unavailable — returning polite error.")
-        return None, db_name, error_msg
+        return None, db_name, (
+            f"The database for '{company}' is not available. "
+            "Please contact your administrator."
+        )
 
-    # Step 2: pick relevant tables
-    relevant_tables = pick_relevant_tables(user_query, db_name)
-    if not relevant_tables:
-        print(f"[route_query] No relevant tables found in {db_name}")
+    # Step 2: Python keyword filter — 1051 → ~10-30 tables, 0 tokens
+    filtered = filter_tables_by_keywords(user_query, schema)
+    if not filtered:
+        print(f"[route_query] No tables matched query keywords.")
         return None, db_name, None
 
-    # Step 3: generate SQL using only real columns from real tables
-    focused_schema = get_schema_for_tables(relevant_tables, db_name)
+    # Step 3: build compact schema and generate SQL in ONE LLM call
+    compact_schema = build_ultra_compact_schema(db_name, filtered)
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -281,19 +222,27 @@ def route_query(user_query: str) -> tuple[str | None, str, str | None]:
             {
                 "role": "system",
                 "content": (
-                    "You are a T-SQL expert for SQL Server. "
-                    "Write only a valid SELECT query using fully qualified table names like [DB].[dbo].[TABLE]. "
-                    "RULES: "
-                    "1. Only use column names that exist in the schema provided — never guess or invent column names. "
-                    "2. If the user mentions a word matching a table name, use it as the FROM table, never as a WHERE filter value. "
-                    "3. If the user mentions a standalone number, filter by the primary key or sequence column (INVHSEQ, SEQ, etc), NOT by date or amount columns. "
-                    "4. For totals or best sellers, SUM the amount column directly — do not add wrong WHERE filters. "
-                    "5. No explanation, no markdown, no backticks."
+                    "You are a T-SQL expert for SQL Server.\n"
+                    "You generate correct SQL based on BUSINESS MEANING, not just column names.\n\n"
+
+                    "You are given:\n"
+                    "1. A schema with tables and columns\n"
+                    "2. OPTIONAL business meaning of columns (VERY IMPORTANT)\n\n"
+
+                    "RULES:\n"
+                    "1. Only use columns from schema.\n"
+                    "2. Always interpret queries in BUSINESS TERMS first (sales, customers, invoices, payments).\n"
+                    "3. If multiple tables exist, choose joins only when business relationship is logical.\n"
+                    "4. NEVER assume column meaning unless explicitly stated.\n"
+                    "5. 'top/best seller' means highest SUM(quantity or amount related to sales).\n"
+                    "6. Avoid incorrect aggregations on unrelated fields (dates, IDs, codes).\n"
+                    "7. Return ONLY valid SQL Server query.\n"
+                    "8. No explanation, no markdown.\n"
                 )
             },
             {
                 "role": "user",
-                "content": f"Schema:\n{focused_schema}\n\nQuestion: {user_query}\n\nSQL:"
+                "content": f"Schema:\n{compact_schema}\n\nQuestion: {user_query}\n\nSQL:"
             }
         ],
         temperature=0,
@@ -302,13 +251,11 @@ def route_query(user_query: str) -> tuple[str | None, str, str | None]:
 
     sql = response.choices[0].message.content.strip()
     sql = sql.replace("```sql", "").replace("```", "").strip()
-    print(f"[route_query] DB: {db_name} | Generated SQL: {sql}")
+    print(f"[route_query] Generated SQL:\n{sql}")
 
     if not sql.upper().startswith("SELECT"):
         return None, db_name, None
-
     if "SUM(AUDTDATE)" in sql.upper():
-        print("[Validator] Invalid SQL detected")
         return None, db_name, "Invalid aggregation on date column."
 
     return sql, db_name, None

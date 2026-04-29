@@ -61,6 +61,7 @@ from fastapi import Query
 @router.get("/debug/schema")
 def debug_schema(db: str = Query(default="SAMINC")):
     schema = get_full_schema(db)
+    print(f"[API] Schema for {db}: {list(schema.keys())}")
     return {
         "db": db,
         "table_count": len(schema),
@@ -69,6 +70,30 @@ def debug_schema(db: str = Query(default="SAMINC")):
             k: schema[k] for k in list(schema.keys())[:3]
         }
     }
+print(f"[API] Router initialized with {len(router.routes)} routes.")
+
+@router.get("/debug/schema/preview")
+def preview_schema(db: str = "SAMINC", limit: int = 5):
+    schema = get_full_schema(db)
+
+    preview = {}
+
+    for table, cols in schema.items():
+
+        # CASE 1: dict -> convert to list
+        if isinstance(cols, dict):
+            cols_list = list(cols.keys())
+
+        # CASE 2: list already correct
+        elif isinstance(cols, list):
+            cols_list = cols
+
+        else:
+            cols_list = []
+
+        preview[table] = cols_list[:limit]
+
+    return preview
 
 
 # -------------------------------------------------------
