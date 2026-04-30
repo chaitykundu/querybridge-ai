@@ -1,6 +1,9 @@
 # app/services/schema_service.py
 
 from app.db.connection import get_connection
+from app.core.config import settings
+
+FROZEN_YEAR = settings.DB_CONTEXT["saminc"]["frozen_year"]
 
 SCHEMA_CACHE = {}
 

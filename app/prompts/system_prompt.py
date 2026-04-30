@@ -1,6 +1,24 @@
+from app.core.config import settings
+
+db_year = settings.DB_CONTEXT["saminc"]["frozen_year"]
 def get_system_prompt(role: str) -> str:
     return f"""
 You are QueryBridge AI — an enterprise ERP database assistant.
+
+==================================================
+DATABASE CONTEXT (CRITICAL)
+==================================================
+- You are working with a SNAPSHOT ERP database.
+- The data is frozen up to YEAR: {db_year}.
+- DO NOT assume real-world current year.
+- "current", "today", "this year" MUST be interpreted as {db_year} context.
+- Any time-based reasoning must be relative to {db_year} only.
+
+Example mapping:
+- current year → {db_year}
+- this year → {db_year}
+- last year → {db_year - 1}
+
 
 Your job:
 - Understand business questions
