@@ -12,34 +12,45 @@ client = OpenAI(api_key=settings.OPENAI_API_KEY)
 # -----------------------------
 def summarize_data_with_ai(query: str, data: list, role: str, db_name: str="", chat_history: list = None) -> str:
     if chat_history is None:
-        chat_history = []
+        chat_history =[]
 
+    # Handle completely empty datasets gracefully before hitting the LLM
     if not data:
         return (
-            "I could not find relevant data to answer this. "
-            "Please try rephrasing your question or specify the database name (e.g. saminc, stars)."
+            f"I couldn't find any relevant data in the '{db_name}' database for your query. "
+            "Please try rephrasing or verify that the data exists for this timeframe."
         )
 
+    # Handle SQL execution errors gracefully
     if isinstance(data, dict) and "error" in data:
-        return f"There was a database error: {data['error']}"
+        return (
+            f"I couldn't retrieve the requested information from {db_name} due to a technical issue. "
+            "Please try again or contact your system administrator if the problem persists."
+        )
 
+    # Limit rows to prevent blowing up the LLM token limit
     data_str = str(data[:50])
 
     prompt = f"""
-You are a helpful ERP assistant responding to a {role}.
+You are an Executive Business Analyst. Your job is to translate raw ERP database results into a professional, human-readable answer.
 
-The user asked: "{query}"
-Data source: Company database — {db_name}   # ← ADD THIS LINE
+User's Question: "{query}"
+Target Company/Database: {db_name}
+User Role: {role}
 
-The database returned this data:
+Raw Database Results:
 {data_str}
 
-Write a clear, concise, human-friendly answer based only on this data.
-- Use actual numbers and facts from the data
-- Use bullet points if there are multiple rows
-- Do NOT mention SQL, tables, columns, or any technical details
-- If the data is empty or unclear, say so honestly
-- NEVER invent or guess numbers not present in the data
+STRICT PRESENTATION RULES:
+1. Direct Answer First: Give the exact numbers or data asked for immediately in the first sentence.
+2. Executive Formatting: 
+   - Use bullet points for lists of 3 or more items.
+   - Use **bold text** for KPIs, totals, and important metrics.
+   - Include currency symbols ($) where it is obvious the metric represents money (e.g., Sales, Revenue, Price).
+3. Comparisons: If the user asks for a comparison (e.g., this year vs last year), format it clearly and state the difference if the data provides it.
+4. Zero Technical Jargon: DO NOT mention "SQL", "database", "tables", "columns", "JSON", "arrays", or "rows". Speak purely in business terms.
+5. Entity Resolution: If the data contains raw IDs (like IDCUST) alongside readable names (like CustomerName), ONLY show the readable names to the user.
+6. Strict Factuality: NEVER invent, hallucinate, or calculate numbers not present or easily derivable from the 'Raw Database Results'.
 """
 
     response = client.chat.completions.create(
@@ -47,7 +58,7 @@ Write a clear, concise, human-friendly answer based only on this data.
         messages=[
             {
                 "role": "system",
-                "content": "You are a helpful ERP business analyst. Summarize database results clearly for non-technical users. Never invent data."
+                "content": "You are a top-tier ERP Business Analyst. You summarize complex data into beautiful, direct, and non-technical business insights."
             },
             *chat_history,
             {
@@ -55,18 +66,19 @@ Write a clear, concise, human-friendly answer based only on this data.
                 "content": prompt
             }
         ],
-        temperature=0.3
+        temperature=0.2  # Lower temperature for highly factual reporting
     )
+    
     print("AI Summary Response:", response.choices[0].message.content.strip())
     return response.choices[0].message.content.strip()
 
 
 # -----------------------------
-# MAIN AI SERVICE
+# MAIN AI SERVICE (The missing function)
 # -----------------------------
 def generate_response(role: str, query: str, chat_history: list = None):
     if chat_history is None:
-        chat_history = []
+        chat_history =[]
 
     sql, db_name, error = route_query(query)
     
@@ -91,6 +103,7 @@ def generate_response(role: str, query: str, chat_history: list = None):
             "data": data,
             "response": summary
         }
+        
     print("[ai_service] No SQL generated — falling back to general LLM response.")
 
     # STEP 2: No SQL — use LLM with history but strict no-hallucination rule

@@ -18,19 +18,22 @@ def execute_query(query: str):
 
 
 def execute_query_on_db(db_name: str, query: str):
-    """Execute a query after switching to a specific database."""
+    """Execute a query on a specific database using fully qualified table names."""
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Switch to the target database before running the query
-    cursor.execute(f"USE [{db_name}]")
-    cursor.execute(query)
+    try:
+        cursor.execute(query)  # query already has [db].[dbo].[TABLE] — no USE needed
 
-    columns = [col[0] for col in cursor.description]
+        if cursor.description is None:
+            return []
 
-    results = []
-    for row in cursor.fetchall():
-        results.append(dict(zip(columns, row)))
+        columns = [col[0] for col in cursor.description]
+        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        return results
 
-    conn.close()
-    return results
+    except Exception as e:
+        raise e
+
+    finally:
+        conn.close()  # always close, even on error
