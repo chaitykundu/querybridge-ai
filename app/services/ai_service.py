@@ -29,7 +29,9 @@ def summarize_data_with_ai(query: str, data: list, role: str, db_name: str="", c
         )
 
     # Limit rows to prevent blowing up the LLM token limit
-    data_str = str(data[:50])
+    capped_data = data[:50]
+    data_str = str(capped_data)
+    exact_row_count = len(capped_data)
 
     prompt = f"""
 You are an Executive Business Analyst. Your job is to translate raw ERP database results into a professional, human-readable answer.
@@ -38,7 +40,7 @@ User's Question: "{query}"
 Target Company/Database: {db_name}
 User Role: {role}
 
-Raw Database Results:
+Raw Database Results ({exact_row_count} records TOTAL — this is the COMPLETE dataset):
 {data_str}
 
 STRICT PRESENTATION RULES:
@@ -50,7 +52,13 @@ STRICT PRESENTATION RULES:
 3. Comparisons: If the user asks for a comparison (e.g., this year vs last year), format it clearly and state the difference if the data provides it.
 4. Zero Technical Jargon: DO NOT mention "SQL", "database", "tables", "columns", "JSON", "arrays", or "rows". Speak purely in business terms.
 5. Entity Resolution: If the data contains raw IDs (like IDCUST) alongside readable names (like CustomerName), ONLY show the readable names to the user.
-6. Strict Factuality: NEVER invent, hallucinate, or calculate numbers not present or easily derivable from the 'Raw Database Results'.
+6. !!CRITICAL — ZERO HALLUCINATION!!:
+   - The dataset above contains EXACTLY {exact_row_count} records. You MUST present EXACTLY {exact_row_count} items — no more, no less.
+   - NEVER add, invent, or infer any names, numbers, or records not explicitly present in the Raw Database Results above.
+   - Do NOT use chat history to supplement or fill in missing data.
+   - If there are only {exact_row_count} results, say so — do not pad the list.
+7. PROFIT/COST CAVEAT: If the user asked about profit or most profitable but the data only contains Revenue (no Cost or Profit column), clearly note:
+   Note: Item cost data is not recorded in the system, so results are ranked by revenue. For true profit analysis, item costs need to be entered in SAGE 300.
 """
 
     response = client.chat.completions.create(
