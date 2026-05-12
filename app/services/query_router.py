@@ -487,15 +487,34 @@ def detect_database(user_query: str) -> str:
 # ================================================================
 # STEP 1: Quick non-business check (skip DB entirely)
 # ================================================================
-NON_BUSINESS_WORDS = {
-    "weather", "joke", "movie", "music", "song", "recipe", "python", "code",
-    "program", "sports", "news", "capital", "country", "translate", "history",
-    "science", "game", "cook", "restaurant", "travel", "forecast", "poem",
-}
-
 def is_business_query(user_query: str) -> bool:
-    words = set(re.findall(r"[a-z]+", user_query.lower()))
-    return not bool(words & NON_BUSINESS_WORDS)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a business query classifier.\n"
+                    "Return ONLY 'yes' if the query is related to business, ERP, sales, customers, vendors, inventory, finance, or accounting.\n"
+                    "Return ONLY 'no' for everything else: greetings, general knowledge, recipes, coding, jokes, weather, small talk etc.\n"
+                    "Examples:\n"
+                    "- 'Hello' → no\n"
+                    "- 'How are you' → no\n"
+                    "- 'chicken roast recipe' → no\n"
+                    "- 'top customers by revenue' → yes\n"
+                    "- 'who owes me money' → yes\n"
+                    "- 'tell me a joke' → no\n"
+                    "No explanation. Just yes or no."
+                )
+            },
+            {"role": "user", "content": user_query}
+        ],
+        temperature=0,
+        max_tokens=5
+    )
+    result = response.choices[0].message.content.strip().lower()
+    print(f"[is_business_query] '{user_query}' → {result}")
+    return result == "yes"
 
 
 # ================================================================
@@ -524,6 +543,7 @@ def select_tables_for_query(user_query: str) -> list[str]:
                     "10. For customer sales history (who bought most) → OEINVH, ARCUS\n"
                     "11. For GL balances → GLAFS\n"
                     "12. For inactive customers (no purchase in N years) → ARCUS only\n\n"
+                    "13. If the question is NOT business-related (greeting, recipe, joke, general knowledge), return: none\n"
                     f"AVAILABLE TABLES:\n{REGISTRY_SUMMARY}"
                 )
             },
