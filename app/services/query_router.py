@@ -485,80 +485,40 @@ def detect_database(user_query: str) -> str:
 
 
 # ================================================================
-# STEP 1: Quick non-business check (skip DB entirely)
+# STEP 1 + 2: Single LLM call — business check + table selection
+# No static rules — LLM reads REGISTRY_SUMMARY and decides itself
 # ================================================================
-def is_business_query(user_query: str) -> bool:
+def classify_and_select_tables(user_query: str) -> list[str]:
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "You are a business query classifier.\n"
-                    "Return ONLY 'yes' if the query is related to business, ERP, sales, customers, vendors, inventory, finance, or accounting.\n"
-                    "Return ONLY 'no' for everything else: greetings, general knowledge, recipes, coding, jokes, weather, small talk etc.\n"
-                    "Examples:\n"
-                    "- 'Hello' → no\n"
-                    "- 'How are you' → no\n"
-                    "- 'chicken roast recipe' → no\n"
-                    "- 'top customers by revenue' → yes\n"
-                    "- 'who owes me money' → yes\n"
-                    "- 'tell me a joke' → no\n"
-                    "No explanation. Just yes or no."
+                    "You are a SAGE 300 ERP query analyzer.\n\n"
+                    "Your job:\n"
+                    "1. Decide if the question is related to business, ERP, sales, customers, vendors, inventory, finance, or accounting.\n"
+                    "2. If YES — return ONLY a comma-separated list of the minimum tables needed (max 4).\n"
+                    "3. If NO (greetings, recipes, jokes, general knowledge, small talk) — return: none\n\n"
+                    "No explanation. No punctuation. Just table names or 'none'.\n\n"
+                    f"AVAILABLE TABLES WITH PURPOSE:\n{REGISTRY_SUMMARY}"
                 )
             },
             {"role": "user", "content": user_query}
-        ],
-        temperature=0,
-        max_tokens=5
-    )
-    result = response.choices[0].message.content.strip().lower()
-    print(f"[is_business_query] '{user_query}' → {result}")
-    return result == "yes"
-
-
-# ================================================================
-# STEP 2: LLM selects exact tables from registry
-# Works for ANY question — no hardcoded keywords
-# ================================================================
-def select_tables_for_query(user_query: str) -> list[str]:
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a SAGE 300 ERP table selector.\n"
-                    "Given a business question, pick the MINIMUM set of tables needed.\n\n"
-                    "Rules:\n"
-                    "1. Return ONLY a comma-separated list of table names. Nothing else.\n"
-                    "2. Maximum 4 tables.\n"
-                    "3. Always include a master table (ARCUS, ICITEM, APVEN, ARSAP) when joining.\n"
-                    "4. For salesperson ranking → OESHID, OESHIH, ARSAP\n"
-                    "5. For item sales → OEINVD, OEINVH, ICITEM\n"
-                    "6. For customer outstanding → AROBL, ARCUS\n"
-                    "7. For customer overdue aging → ARAGED, ARCUS\n"
-                    "8. For vendor outstanding → APOBL, APVEN\n"
-                    "9. For overall company revenue/trend → OESTATS\n"
-                    "10. For customer sales history (who bought most) → OEINVH, ARCUS\n"
-                    "11. For GL balances → GLAFS\n"
-                    "12. For inactive customers (no purchase in N years) → ARCUS only\n\n"
-                    "13. If the question is NOT business-related (greeting, recipe, joke, general knowledge), return: none\n"
-                    f"AVAILABLE TABLES:\n{REGISTRY_SUMMARY}"
-                )
-            },
-            {"role": "user", "content": f"Question: {user_query}"}
         ],
         temperature=0,
         max_tokens=60
     )
 
     raw = response.choices[0].message.content.strip()
+    if raw.lower() == "none":
+        print(f"[classify_and_select] '{user_query}' → non-business, skipping DB.")
+        return []
+
     tables = [t.strip().upper() for t in raw.split(",") if t.strip()]
     valid = [t for t in tables if t in BUSINESS_SCHEMA_REGISTRY]
-    print(f"[select_tables] '{user_query}' → {valid}")
+    print(f"[classify_and_select] '{user_query}' → {valid}")
     return valid
-
 
 # ================================================================
 # STEP 3: Load schema from DB (cached per session)
@@ -811,24 +771,19 @@ def route_query(user_query: str) -> tuple[str | None, str, str | None]:
     # Step 0: Which company?
     db_name = detect_database(user_query)
 
-    # Step 1: Non-business check — skip DB entirely
-    if not is_business_query(user_query):
-        print("[route_query] Non-business query. Skipping DB.")
-        return None, db_name, None
-
-    # Step 2: LLM picks exact tables from registry
-    selected_tables = select_tables_for_query(user_query)
+    # Step 1: Single LLM call — business check + table selection
+    selected_tables = classify_and_select_tables(user_query)
     if not selected_tables:
-        print("[route_query] No tables selected.")
+        print("[route_query] Non-business or unrecognized query. Skipping DB.")
         return None, db_name, None
 
-    # Step 3: Load full schema (cached — only hits DB once per session)
+    # Step 2: Load full schema (cached — only hits DB once per session)
     full_schema = get_full_schema(db_name)
     if not full_schema:
         company = next((k for k, v in DATABASE_NAME_MAP.items() if v == db_name), db_name)
         return None, db_name, f"The database for '{company}' is not available."
 
-    # Step 4: Extract only selected tables' schema
+    # Step 3: Extract only selected tables' schema
     focused_schema = get_schema_for_tables(selected_tables, full_schema)
     if not focused_schema:
         print("[route_query] Selected tables not found in DB.")
@@ -836,7 +791,7 @@ def route_query(user_query: str) -> tuple[str | None, str, str | None]:
 
     print(f"[route_query] Schema: {len(full_schema)} total → {len(focused_schema)} selected: {list(focused_schema.keys())}")
 
-    # Step 5: Generate SQL with focused schema + proven patterns
+    # Step 4: Generate SQL with focused schema + proven patterns
     sql = generate_sql(user_query, db_name, focused_schema, selected_tables)
 
     if not sql or not sql.upper().startswith("SELECT"):

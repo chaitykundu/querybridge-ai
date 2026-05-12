@@ -4,9 +4,9 @@ import requests
 # Your FastAPI endpoint
 API_URL = "http://localhost:8004/chat"
 
-st.set_page_config(page_title="AI Chatbot", layout="centered")
+st.set_page_config(page_title="QueryBridge AI - ERP Assistant", layout="centered")
 
-st.title("💬 AI Chatbot Tester")
+st.title("💬 QueryBridge AI - ERP Assistant")
 
 # Initialize session state
 if "messages" not in st.session_state:
