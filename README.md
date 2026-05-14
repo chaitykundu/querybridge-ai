@@ -1,6 +1,7 @@
 # QueryBridge AI
 
 uvicorn app.main:app --reload --port 8004
+streamlit run streamlit_app.py
 
 
 ## Getting started
