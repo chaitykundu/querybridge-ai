@@ -511,65 +511,33 @@ with st.sidebar:
     # ── User menu popup ───────────────────────
     if st.session_state.user_menu_open:
         st.markdown('<div class="user-menu-box">', unsafe_allow_html=True)
-        st.markdown('<div class="ctx-rename">', unsafe_allow_html=True)
-        if st.button("⚙️   Settings", key="menu_settings", use_container_width=True):
-            st.session_state.user_menu_open = False
-            st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('<div style="border-top:1px solid #2a2a2a;margin:4px 0;"></div>', unsafe_allow_html=True)
         st.markdown('<div class="logout-btn">', unsafe_allow_html=True)
-        if st.button("🚪   Log out", key="menu_logout", use_container_width=True):
+        if st.button("   Log out", key="menu_logout", use_container_width=True):
             do_logout()
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Profile bar pinned at bottom ──────────
+    # ── Profile bar ───────────────────────────
     initials = "".join(w[0].upper() for w in st.session_state.user_name.split()[:2]) or "U"
-
-    # Invisible toggle button styled to look like the profile card
-    st.markdown(f"""
-    <style>
-    /* Hide the default button text, overlay it on the profile card */
-    div[data-testid="stSidebar"] [data-testid="baseButton-secondary"][kind="secondary"]:last-of-type {{
-        position: absolute !important;
-        bottom: 0 !important;
-        left: 0 !important;
-        width: 100% !important;
-        height: 64px !important;
-        opacity: 0 !important;
-        z-index: 10 !important;
-        cursor: pointer !important;
-    }}
-    .profile-fixed {{
-        position: fixed;
-        bottom: 0;
-        left: 0;
-        width: 244px;
-        background: #0f0f0f;
-        border-top: 1px solid #1e1e1e;
-        z-index: 5;
-        box-sizing: border-box;
-    }}
-    </style>
-    <div class="profile-fixed">
-        <div class="user-profile-block">
+    col_profile, col_dots = st.columns([5, 1])
+    with col_profile:
+        st.markdown(f"""
+        <div class="user-profile-block" style="border-top:none;padding:10px 4px;">
             <div class="avatar-circle">{initials}</div>
             <div style="flex:1;overflow:hidden;">
                 <div class="uname">{st.session_state.user_name}</div>
                 <div class="uemail">{st.session_state.user_email}</div>
             </div>
-            <span style="color:#555;font-size:18px;">···</span>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+    with col_dots:
+        st.markdown('<div class="menu-col">', unsafe_allow_html=True)
+        if st.button("⋯", key="profile_toggle"):
+            st.session_state.user_menu_open = not st.session_state.user_menu_open
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    # # Actual clickable button (invisible, sits over the card via CSS)
-    # if st.button("profile", key="profile_toggle", use_container_width=True, help="Account menu"):
-    #     st.session_state.user_menu_open = not st.session_state.user_menu_open
-    #     st.rerun()
-
-    # Bottom padding so chat list isn't hidden behind the fixed card
     st.markdown("<div style='height:70px'></div>", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════
